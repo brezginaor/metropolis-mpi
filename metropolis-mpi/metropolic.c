@@ -165,6 +165,8 @@ int main(int argc, char *argv[])
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    double t_start = MPI_Wtime();
+
     /* параметры из командной строки: T sigma */
     if (argc > 1) {
         int tmpT = atoi(argv[1]);
@@ -280,6 +282,12 @@ int main(int argc, char *argv[])
         /* суммы квадратов координат */
         MPI_Send(local_sumsq_x, 2, MPI_DOUBLE,
                  0, 2, MPI_COMM_WORLD);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t_end = MPI_Wtime();
+    if (rank == 0) {
+        printf("\nElapsed time: %.6f seconds\n", t_end - t_start);
     }
 
     free_rng_stream();
