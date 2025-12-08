@@ -6,10 +6,17 @@
 
 #define SEED 123456789
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* ---------- Глобальный генератор SPRNG для каждого процесса ---------- */
 
 static int *rng_stream = NULL;
 
-void init_rng_stream(int rank, int size){
+void init_rng_stream(int rank, int size)
+{
+    /* int *init_rng(int gennum, int total_gen, int seed, int param); */
     rng_stream = init_rng(rank, size, SEED, 0);
     if (rng_stream == NULL) {
         fprintf(stderr, "Rank %d: init_rng failed\n", rank);
@@ -25,9 +32,7 @@ void free_rng_stream(void)
     }
 }
 
-//sprng берёт внутреннее состояние генератора, на которое указывает rng_stream
-//обновляет его (переходит к следующему состоянию),
-//возвращает одно случайное число с плавающей точкой в интервале [0, 1)
+/* равномерное [0,1) */
 double rng_uniform01(void)
 {
     return sprng(rng_stream);
@@ -47,25 +52,29 @@ double rng_normal01(void)
     return r * cos(theta);
 }
 
-//π(x) — насколько эта точка вероятна».
+/* лог-плотность π(x) ~ N(0, I) в 2D, x = (x0, x1) */
 double log_pi(const double x[2])
 {
     return -0.5 * (x[0] * x[0] + x[1] * x[1]);
 }
 
+/* предложение: y = x + N(0, sigma^2 I) */
 void q_sample(const double x[2], double y[2], double sigma)
 {
     y[0] = x[0] + sigma * rng_normal01();
     y[1] = x[1] + sigma * rng_normal01();
 }
 
-//logp - указатель на текущее значение log π(x)
-void metropolis_step(double x[2], double *logp, double sigma,int *accepted){
-
+/* один шаг Метрополиса */
+void metropolis_step(double x[2],
+                     double *logp,
+                     double sigma,
+                     int *accepted)
+{
     double y[2];
     q_sample(x, y, sigma);
 
-    ouble logp_new = log_pi(y);
+    double logp_new = log_pi(y);   /* <-- здесь была опечатка "ouble" */
     double log_r = logp_new - (*logp);
 
     if (log_r >= 0.0) {
@@ -86,18 +95,20 @@ void metropolis_step(double x[2], double *logp, double sigma,int *accepted){
     }
 }
 
+/* одна цепочка на одном ранге, плюс локальные суммы для статистик */
 double run_chain(const double x0[2], double sigma, int T, int rank,
-                int *accepted_total_out,
-                double sum_x_out[2],
-                double sumsq_x_out[2]){
-        double x[2] = {x0[0], x0[1]};
+                 int *accepted_total_out,
+                 double sum_x_out[2],
+                 double sumsq_x_out[2])
+{
+    double x[2] = {x0[0], x0[1]};
     double logp = log_pi(x);
 
     int accepted_count = 0;
     int acc;
 
-    double sum_x[2]    = {0.0, 0.0};
-    double sumsq_x[2]  = {0.0, 0.0};
+    double sum_x[2]   = {0.0, 0.0};
+    double sumsq_x[2] = {0.0, 0.0};
 
     char filename[64];
     snprintf(filename, sizeof(filename), "chain_rank%d.dat", rank);
@@ -114,6 +125,7 @@ double run_chain(const double x0[2], double sigma, int T, int rank,
         metropolis_step(x, &logp, sigma, &acc);
         accepted_count += acc;
 
+        /* копим суммы для mean/variance */
         sum_x[0]   += x[0];
         sum_x[1]   += x[1];
         sumsq_x[0] += x[0] * x[0];
@@ -140,17 +152,20 @@ double run_chain(const double x0[2], double sigma, int T, int rank,
     return acc_rate;
 }
 
-int main(int argc, char *argv[]){
-        int rank, size;
-    int T = 1000;          /* длина цепи на каждом процессе */
-    double sigma = 0.5;     /* шаг предложения */
+/* ---------- main с MPI, Gather и ручным Send/Recv ---------- */
+
+int main(int argc, char *argv[])
+{
+    int rank, size;
+    int T = 1000;       /* длина цепи на каждом процессе */
+    double sigma = 0.5; /* шаг предложения */
     double x0[2] = {0.0, 0.0};
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // параметры из командной строки: T sigma
+    /* параметры из командной строки: T sigma */
     if (argc > 1) {
         int tmpT = atoi(argv[1]);
         if (tmpT > 0) T = tmpT;
@@ -167,14 +182,21 @@ int main(int argc, char *argv[]){
         printf("Proposal sigma: %f\n", sigma);
     }
 
-    //инициализация SPRNG для каждого процесса
+    /* инициализация SPRNG для каждого процесса */
     init_rng_stream(rank, size);
 
-    //локальная цепочка
-    double local_acc_rate = run_chain(x0, sigma, T, rank, &local_accepted,
-                                  local_sum_x,
-                                  local_sumsq_x);
+    /* локальные статистики для этого ранга */
+    int    local_accepted   = 0;
+    double local_sum_x[2]   = {0.0, 0.0};
+    double local_sumsq_x[2] = {0.0, 0.0};
 
+    /* запускаем локальную цепочку */
+    double local_acc_rate = run_chain(x0, sigma, T, rank,
+                                      &local_accepted,
+                                      local_sum_x,
+                                      local_sumsq_x);
+
+    /* ---------- Собираем acceptance rate по рангам (через MPI_Gather) ---------- */
     double *all_rates = NULL;
     if (rank == 0) {
         all_rates = (double *)malloc(size * sizeof(double));
@@ -196,7 +218,7 @@ int main(int argc, char *argv[]){
         free(all_rates);
     }
 
-    /* ---------- Теперь ВСЁ остальное только через Send/Recv ---------- */
+    /* ---------- Глобальные статистики через ручной Send/Recv ---------- */
 
     if (rank == 0) {
         /* инициализируем глобальные суммы своими локальными значениями */
@@ -264,4 +286,3 @@ int main(int argc, char *argv[]){
     MPI_Finalize();
     return 0;
 }
-
