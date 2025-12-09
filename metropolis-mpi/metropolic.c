@@ -158,45 +158,40 @@ int main(int argc, char *argv[])
 {
     int rank, size;
 
-    /* TOTAL_T — общее число шагов по всем процессам вместе */
-    long long TOTAL_T = 1000;    /* по умолчанию */
-    double sigma = 0.5;          /* шаг предложения */
-    double x0[2] = {0.0, 0.0};   /* стартовая точка */
+    int    TOTAL_T = 200000;   /* суммарное число шагов по ВСЕМ процессам */
+    double sigma   = 0.5;      /* шаг предложения */
+    double x0[2]   = {0.0, 0.0};
+    int    quiet   = 0;        /* 0 = подробный вывод, 1 = «тихий» для свипов */
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    double t_start = MPI_Wtime();
-
-    /* аргументы командной строки:
-       argv[1] — TOTAL_T (общее число шагов по всем ранкам)
-       argv[2] — sigma
-       пример: mpirun -np 4 ./metropolic 200000 0.5
-    */
+    /* argv[1] = TOTAL_T, argv[2] = sigma, argv[3] = quiet */
     if (argc > 1) {
-        long long tmpT = atoll(argv[1]);
+        int tmpT = atoi(argv[1]);
         if (tmpT > 0) TOTAL_T = tmpT;
     }
     if (argc > 2) {
         double tmpS = atof(argv[2]);
         if (tmpS > 0.0) sigma = tmpS;
     }
+    if (argc > 3) {
+        quiet = (atoi(argv[3]) != 0);
+    }
 
-    /* делим TOTAL_T по ранкам как можно равномернее:
-       base = floor(TOTAL_T / size)
-       первые rem рангов получают +1 шаг
-    */
-    long long base = TOTAL_T / size;
-    int rem        = (int)(TOTAL_T % size);
+    /* делим TOTAL_T по рангам как можно ровнее */
+    int base_T = TOTAL_T / size;
+    int rem    = TOTAL_T % size;
+    int T_local = (rank < rem) ? (base_T + 1) : base_T;
+    if (T_local < 2) T_local = 2;  /* чтобы было хотя бы 1 наблюдение */
 
-    int T_local = (int)base + (rank < rem ? 1 : 0);
-    int N_local = (T_local > 0 ? T_local - 1 : 0);  /* сколько точек реально идёт в статистику */
+    double t_start = MPI_Wtime();
 
-    if (rank == 0) {
+    if (rank == 0 && !quiet) {
         printf("Metropolis + MPI + SPRNG\n");
         printf("Processes: %d\n", size);
-        printf("TOTAL_T (sum over ranks): %lld\n", TOTAL_T);
+        printf("TOTAL_T (sum over ranks): %d\n", TOTAL_T);
         printf("Local T on rank 0: %d\n", T_local);
         printf("Proposal sigma: %f\n", sigma);
     }
@@ -209,11 +204,8 @@ int main(int argc, char *argv[])
     double local_sum_x[2]   = {0.0, 0.0};
     double local_sumsq_x[2] = {0.0, 0.0};
 
-    /* запускаем локальную цепочку длиной T_local */
-    double local_acc_rate = run_chain(x0,
-                                      sigma,
-                                      T_local,
-                                      rank,
+    /* запускаем локальную цепочку */
+    double local_acc_rate = run_chain(x0, sigma, T_local, rank,
                                       &local_accepted,
                                       local_sum_x,
                                       local_sumsq_x);
@@ -228,7 +220,7 @@ int main(int argc, char *argv[])
                all_rates,        1, MPI_DOUBLE,
                0, MPI_COMM_WORLD);
 
-    if (rank == 0) {
+    if (rank == 0 && !quiet) {
         printf("\nAcceptance rates per rank:\n");
         double sum_rates = 0.0;
         for (int i = 0; i < size; ++i) {
@@ -237,6 +229,8 @@ int main(int argc, char *argv[])
         }
         printf("Average acceptance rate (by ranks): %.4f\n",
                sum_rates / (double)size);
+    }
+    if (all_rates) {
         free(all_rates);
     }
 
@@ -247,14 +241,17 @@ int main(int argc, char *argv[])
         int    global_accepted   = local_accepted;
         double global_sum_x[2]   = { local_sum_x[0],   local_sum_x[1]   };
         double global_sumsq_x[2] = { local_sumsq_x[0], local_sumsq_x[1] };
-        long long global_N       = (long long)N_local;
+
+        /* и одновременно считаем реальное число сэмплов (может отличаться по рангам) */
+        long long global_samples =
+            (long long)((T_local > 1) ? (T_local - 1) : 0);
 
         /* принимаем данные от рангов 1..size-1 */
         for (int src = 1; src < size; ++src) {
             int    recv_accepted;
             double recv_sum_x[2];
             double recv_sumsq_x[2];
-            int    recv_N;
+            int    recv_T_local;
 
             /* сначала число принятых шагов */
             MPI_Recv(&recv_accepted, 1, MPI_INT,
@@ -268,8 +265,8 @@ int main(int argc, char *argv[])
             MPI_Recv(recv_sumsq_x, 2, MPI_DOUBLE,
                      src, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-            /* а теперь N_local с этого ранга */
-            MPI_Recv(&recv_N, 1, MPI_INT,
+            /* и локальная длина цепи на src (чтобы точно посчитать N) */
+            MPI_Recv(&recv_T_local, 1, MPI_INT,
                      src, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             global_accepted   += recv_accepted;
@@ -277,24 +274,36 @@ int main(int argc, char *argv[])
             global_sum_x[1]   += recv_sum_x[1];
             global_sumsq_x[0] += recv_sumsq_x[0];
             global_sumsq_x[1] += recv_sumsq_x[1];
-            global_N          += (long long)recv_N;
+
+            long long samples_src =
+                (long long)((recv_T_local > 1) ? (recv_T_local - 1) : 0);
+            global_samples += samples_src;
         }
 
-        /* считаем глобальные статистики по всем сэмплам */
-        double N_as_double = (double)global_N;
+        double t_end   = MPI_Wtime();
+        double elapsed = t_end - t_start;
 
-        double mean0 = global_sum_x[0] / N_as_double;
-        double mean1 = global_sum_x[1] / N_as_double;
+        long long N = (global_samples > 0) ? global_samples : 1;
 
-        double var0 = global_sumsq_x[0] / N_as_double - mean0 * mean0;
-        double var1 = global_sumsq_x[1] / N_as_double - mean1 * mean1;
+        double mean0 = global_sum_x[0] / (double)N;
+        double mean1 = global_sum_x[1] / (double)N;
 
-        double acc_rate_global = (double)global_accepted / N_as_double;
+        double var0 = global_sumsq_x[0] / (double)N - mean0 * mean0;
+        double var1 = global_sumsq_x[1] / (double)N - mean1 * mean1;
 
-        printf("\nGlobal stats over all ranks (via Send/Recv):\n");
-        printf("  Acceptance rate (per step): %.6f\n", acc_rate_global);
-        printf("  Mean:     [%.6f, %.6f]\n", mean0, mean1);
-        printf("  Variance: [%.6f, %.6f]\n", var0, var1);
+        double acc_rate_global = (double)global_accepted / (double)N;
+
+        if (!quiet) {
+            printf("\nGlobal stats over all ranks (via Send/Recv):\n");
+            printf("  Acceptance rate (per step): %.6f\n", acc_rate_global);
+            printf("  Mean:     [%.6f, %.6f]\n", mean0, mean1);
+            printf("  Variance: [%.6f, %.6f]\n", var0, var1);
+            printf("\nElapsed time: %.6f seconds\n", elapsed);
+        } else {
+            /* компактный вывод для больших свипов */
+            printf("NP=%d TOTAL_T=%d elapsed=%.6f\n",
+                   size, TOTAL_T, elapsed);
+        }
     } else {
         /* не-нолевые ранги отсылают свои локальные суммы рангу 0 */
 
@@ -310,19 +319,12 @@ int main(int argc, char *argv[])
         MPI_Send(local_sumsq_x, 2, MPI_DOUBLE,
                  0, 2, MPI_COMM_WORLD);
 
-        /* количество использованных точек N_local = T_local - 1 */
-        MPI_Send(&N_local, 1, MPI_INT,
+        /* локальная длина цепи на этом ранге */
+        MPI_Send(&T_local, 1, MPI_INT,
                  0, 3, MPI_COMM_WORLD);
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_end = MPI_Wtime();
-    if (rank == 0) {
-        printf("\nElapsed time: %.6f seconds\n", t_end - t_start);
     }
 
     free_rng_stream();
     MPI_Finalize();
     return 0;
 }
-
