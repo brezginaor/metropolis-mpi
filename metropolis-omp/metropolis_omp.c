@@ -152,11 +152,12 @@ double run_chain(int thread_id,
 
 int main(int argc, char *argv[])
 {
-    /* TOTAL_T — суммарная длина по ВСЕМ цепям (как в MPI-варианте) */
+    /* TOTAL_T — суммарная длина по всем цепочкам */
     long long TOTAL_T = 200000;  /* по умолчанию */
     double sigma = 0.5;          /* шаг предложения */
     double x0[2] = {0.0, 0.0};
 
+    /* чтение параметров: TOTAL_T sigma */
     if (argc > 1) {
         long long tmpT = atoll(argv[1]);
         if (tmpT > 0) TOTAL_T = tmpT;
@@ -166,13 +167,7 @@ int main(int argc, char *argv[])
         if (tmpS > 0.0) sigma = tmpS;
     }
 
-    int max_threads = omp_get_max_threads();
-
-    printf("Metropolis + OpenMP\n");
-    printf("Max threads available: %d\n", max_threads);
-    printf("TOTAL_T (sum over all chains) = %lld\n", TOTAL_T);
-    printf("Proposal sigma = %f\n\n", sigma);
-
+    /* сколько потоков реально будет */
     int nthreads;
 #pragma omp parallel
     {
@@ -180,15 +175,11 @@ int main(int argc, char *argv[])
         nthreads = omp_get_num_threads();
     }
 
-    printf("Running with %d OpenMP threads\n", nthreads);
-
-    // шагов на одну цепочку (как T_local = TOTAL_T / NP) 
+    /* длина цепочки на поток (как TOTAL_T / NP) */
     int T_per_chain = (int)(TOTAL_T / nthreads);
-    if (T_per_chain < 2) T_per_chain = 2;  
+    if (T_per_chain < 2) T_per_chain = 2;
 
-    printf("T_per_chain = %d\n\n", T_per_chain);
-
-    //массивы для сбора статистик от каждого потока 
+    /* буферы для статистик по потокам */
     double *acc_rates = (double *)malloc(nthreads * sizeof(double));
     int    *accepted  = (int *)   malloc(nthreads * sizeof(int));
     double (*sum_x)[2]   = malloc(nthreads * sizeof *sum_x);
@@ -196,21 +187,23 @@ int main(int argc, char *argv[])
 
     if (!acc_rates || !accepted || !sum_x || !sumsq_x) {
         fprintf(stderr, "Allocation error\n");
+        free(acc_rates);
+        free(accepted);
+        free(sum_x);
+        free(sumsq_x);
         return 1;
     }
 
     double t0 = omp_get_wtime();
 
-// по умолчанию все переменные приватные внутри
+/* --- параллельный запуск цепочек --- */
 #pragma omp parallel
     {
-        //возвр номер потока 
         int tid = omp_get_thread_num();
 
-        //свой seed у каждого потока 
+        /* свой генератор у каждого потока */
         unsigned int rng_state = 123456789u + 17u * (unsigned int)tid;
 
-        //Локальные переменные статистики
         int    loc_accepted;
         double loc_sum_x[2];
         double loc_sumsq_x[2];
@@ -226,7 +219,6 @@ int main(int argc, char *argv[])
             loc_sumsq_x
         );
 
-        // запись результатов    этого потока в глобальные массивы 
         acc_rates[tid]   = acc_rate;
         accepted[tid]    = loc_accepted;
         sum_x[tid][0]    = loc_sum_x[0];
@@ -237,23 +229,13 @@ int main(int argc, char *argv[])
 
     double t1 = omp_get_wtime();
 
-    /* ---------- печать per-thread acceptance ---------- */
-    printf("Acceptance rates per thread:\n");
-    double sum_rates = 0.0;
-    for (int i = 0; i < nthreads; ++i) {
-        printf("  thread %d: %.4f\n", i, acc_rates[i]);
-        sum_rates += acc_rates[i];
-    }
-    printf("Average acceptance rate (by threads): %.4f\n",
-           sum_rates / (double)nthreads);
-
-    /* ---------- глобальные статистики ---------- */
-
+    /* глобальные статистики */
     long long N = (long long)(T_per_chain - 1) * (long long)nthreads;
 
-    long long total_accepted = 0;
-    double global_sum_x0 = 0.0, global_sum_x1 = 0.0;
-    double global_sumsq_x0 = 0.0, global_sumsq_x1 = 0.0;
+    long long total_accepted   = 0;
+    double global_sum_x0       = 0.0, global_sum_x1      = 0.0;
+    double global_sumsq_x0     = 0.0, global_sumsq_x1    = 0.0;
+    double sum_rates           = 0.0;
 
     for (int i = 0; i < nthreads; ++i) {
         total_accepted   += accepted[i];
@@ -261,6 +243,7 @@ int main(int argc, char *argv[])
         global_sum_x1    += sum_x[i][1];
         global_sumsq_x0  += sumsq_x[i][0];
         global_sumsq_x1  += sumsq_x[i][1];
+        sum_rates        += acc_rates[i];
     }
 
     double mean0 = global_sum_x0 / (double)N;
@@ -270,13 +253,39 @@ int main(int argc, char *argv[])
     double var1 = global_sumsq_x1 / (double)N - mean1 * mean1;
 
     double acc_rate_global = (double)total_accepted / (double)N;
+    double avg_rate = sum_rates / (double)nthreads;
 
-    printf("\nGlobal stats over all threads:\n");
+#ifdef VERBOSE
+    /* -------- подробный режим (как раньше) -------- */
+
+    printf("Metropolis + OpenMP\n");
+    printf("Max threads available: %d\n", omp_get_max_threads());
+    printf("TOTAL_T (sum over all chains) = %lld\n", TOTAL_T);
+    printf("Proposal sigma = %f\n\n", sigma);
+
+    printf("Running with %d OpenMP threads\n", nthreads);
+    printf("T_per_chain = %d\n\n", T_per_chain);
+
+    printf("Acceptance rates per thread:\n");
+    for (int i = 0; i < nthreads; ++i) {
+        printf("  thread %d: %.4f\n", i, acc_rates[i]);
+    }
+    printf("Average acceptance rate (by threads): %.4f\n\n", avg_rate);
+
+    printf("Global stats over all threads:\n");
     printf("  Acceptance rate (per step): %.6f\n", acc_rate_global);
     printf("  Mean:     [%.6f, %.6f]\n", mean0, mean1);
-    printf("  Variance: [%.6f, %.6f]\n", var0, var1);
+    printf("  Variance: [%.6f, %.6f]\n\n", var0, var1);
 
-    printf("\nElapsed time (OpenMP): %.6f seconds\n", t1 - t0);
+    printf("Elapsed time (OpenMP): %.6f seconds\n", t1 - t0);
+
+#else
+    /* -------- тихий режим для тестов / графиков -------- */
+
+    long long TOTAL_USED = (long long)T_per_chain * (long long)nthreads;
+    printf("OMP=%d TOTAL_T=%lld elapsed=%.6f\n",
+           nthreads, TOTAL_USED, t1 - t0);
+#endif
 
     free(acc_rates);
     free(accepted);
