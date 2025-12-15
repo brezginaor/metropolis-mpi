@@ -39,7 +39,7 @@ cd "$HOME/metropolis-mpi/metropolis-py-mpi"
 PYFILE="metropolis_mpi.py"
 # если у тебя было metropolis_mpi.py (другая буква) — исправь здесь
 
-TOTAL_T=200000
+TOTAL_T=20000000
 SIGMA=0.5
 WRITE_CHAIN=0
 
