@@ -1,29 +1,42 @@
 #!/bin/bash
-#SBATCH -p cascade
-#SBATCH -N 1
-#SBATCH -n 16
-#SBATCH -t 00:10:00
-#SBATCH -J metro_py_sweep
-#SBATCH -o metro_py_sweep_%j.out
+#SBATCH --job-name=metro_py_mpi_sweep
+#SBATCH --nodes=4
+#SBATCH --ntasks=112
+#SBATCH --cpus-per-task=1
+#SBATCH --time=00:30:00
+#SBATCH --partition=cascade
+#SBATCH --output=logs/py_mpi_sweep_cascade_%j.out
 
-module load compiler/gcc/11 mpi/openmpi/4.1.3/gcc/11 python/3.10
+set -e
 
-# один раз (не в скрипте) нужно будет сделать:
-#   python -m pip install --user mpi4py
+module load mpi/openmpi/4.0.1/gcc/9
+module load python/3.11
 
-echo "Host: $(hostname)"
-echo "SLURM_NTASKS = ${SLURM_NTASKS}"
-echo
+# Быстрая проверка, что mpi4py есть
+python3 -c "import mpi4py; print('mpi4py ok')" 
 
-cd $HOME/metropolis-mpi/metropolis-py-mpi
+cd "$HOME/metropolis-mpi/metropolis-py-mpi"   # <- если у тебя python-код лежит тут
+# если файл лежит в другом месте — поправь путь и имя
 
 TOTAL_T=200000
 SIGMA=0.5
+WRITE_CHAIN=0
 
-for NP in 1 2 4 8 16; do
-    echo "=============================="
-    echo "Running with NP = ${NP}"
-    echo "=============================="
-    mpirun -np ${NP} python metropolis_mpi.py ${TOTAL_T} ${SIGMA}
-    echo
+OUT="$HOME/metropolis-mpi/py_mpi_sweep_1_112_cascade_${SLURM_JOB_ID}.csv"
+echo "p,elapsed" > "$OUT"
+
+for p in $(seq 1 112); do
+  echo "Running p=$p..."
+
+  line=$(mpirun -np $p --mca btl ^openib python3 metropolis_mpi.py $TOTAL_T $SIGMA $WRITE_CHAIN | tail -n 1)
+
+
+  elapsed=$(echo "$line" | sed -n 's/.*Elapsed time (Python + MPI): \([0-9.]*\).*/\1/p')
+
+
+
+  [ -n "$elapsed" ] || { echo "Parse error: $line"; exit 1; }
+  echo "$p,$elapsed" >> "$OUT"
 done
+
+echo "Done: $OUT"
