@@ -30,26 +30,26 @@ LIB="-L$HOME/sprng_lib/sprng/lib -llcg -lm"
 BIN="metropolic_${SLURM_JOB_ID}"
 mpicc -O3 -std=c99 metropolic.c -o "$BIN" $INC $LIB
 
-TOTAL_T=200000
+TOTAL_T=100000000
 SIGMA=0.5
 QUIET=1
+REPS=3
 
 OUT="$HOME/metropolis-mpi/c_mpi_sweep_1_112_tornado_${SLURM_JOB_ID}.csv"
 echo "p,elapsed" > "$OUT"
 
 for p in $(seq 1 112); do
-  echo "Running p=$p..."
-
-  # последняя строка в quiet режиме: NP=... elapsed=...
-  line=$(mpirun -np $p --mca btl ^openib ./"$BIN" $TOTAL_T $SIGMA $QUIET | tail -n 1)
-
-  elapsed=$(echo "$line" | sed -n 's/.*elapsed=\([0-9.]*\).*/\1/p')
-  if [ -z "$elapsed" ]; then
-    echo "Parse error. Last line was: $line"
-    exit 1
-  fi
-
-  echo "$p,$elapsed" >> "$OUT"
+  best=""
+  for r in $(seq 1 $REPS); do
+    line=$(mpirun -np $p --mca btl ^openib ./"$BIN" $TOTAL_T $SIGMA $QUIET | tail -n 1)
+    elapsed=$(echo "$line" | sed -n 's/.*elapsed=\([0-9.]*\).*/\1/p')
+    echo "  rep $r: $elapsed"
+    echo "$elapsed" >> /tmp/times_${SLURM_JOB_ID}_${p}.txt
+  done
+  # медиана:
+  med=$(sort -n /tmp/times_${SLURM_JOB_ID}_${p}.txt | awk 'NR==2{print $1}')
+  rm -f /tmp/times_${SLURM_JOB_ID}_${p}.txt
+  echo "$p,$med" >> "$OUT"
 done
 
 echo ""
