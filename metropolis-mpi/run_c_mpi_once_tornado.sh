@@ -25,6 +25,7 @@ echo "Tasks Allocated   = ${SLURM_NTASKS}"
 echo "Cores/Task        = ${SLURM_CPUS_PER_TASK}"
 echo ""
 
+module purge
 module load compiler/gcc/11 mpi/openmpi/4.1.6/gcc/11
 
 cd "$ROOT/metropolis-mpi"
