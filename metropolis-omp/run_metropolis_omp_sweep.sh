@@ -15,50 +15,38 @@ ROOT="$HOME/metropolis-mpi"
 LOGDIR="$ROOT/logs"
 mkdir -p "$LOGDIR"
 
+cd "$ROOT/metropolis-omp"
+
 echo "Date              = $(date)"
 echo "Host              = $(hostname -s)"
 echo "Working Directory = $(pwd)"
-echo ""
 echo "SLURM_CPUS_PER_TASK = ${SLURM_CPUS_PER_TASK}"
 echo ""
 
-# Папка с OpenMP-бинарником
-cd "$ROOT/metropolis-omp"
+# --- СБОРКА ---
+gcc -O3 -std=c99 -fopenmp metropolis_omp.c -o metropolis_omp -lm
 
-# параметры алгоритма (общее число шагов по всем потокам вместе)
 TOTAL_T=10000000
 SIGMA=0.5
-QUIET=1          # в твоём C-коде quiet определяется через #ifdef, так что тут просто для ясности
-
 REPS=3
 
 OUT="$ROOT/c_omp_sweep_1_48_cascade_${SLURM_JOB_ID}.csv"
 echo "p,elapsed" > "$OUT"
 
 for NT in $(seq 1 48); do
-  if [ "$NT" -gt "${SLURM_CPUS_PER_TASK}" ]; then
-    echo "Skipping NT=${NT}: exceeds SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK}"
-    continue
-  fi
+  [ "$NT" -le "${SLURM_CPUS_PER_TASK}" ] || continue
 
   echo "Running OMP_NUM_THREADS=$NT..."
 
   for r in $(seq 1 $REPS); do
     export OMP_NUM_THREADS="$NT"
-
-    line=$(./metropolis_omp "$TOTAL_T" "$SIGMA" | tail -n 1)
+    line=$(srun ./metropolis_omp "$TOTAL_T" "$SIGMA" | tail -n 1)
     elapsed=$(echo "$line" | sed -n 's/.*elapsed=\([0-9.]*\).*/\1/p')
-
-    if [ -z "$elapsed" ]; then
-      echo "Parse error (NT=$NT, rep=$r). Last line was: $line"
-      exit 1
-    fi
-
+    [ -n "$elapsed" ] || { echo "Parse error (NT=$NT rep=$r): $line"; exit 1; }
     echo "  rep $r: $elapsed"
     echo "$elapsed" >> /tmp/times_${SLURM_JOB_ID}_${NT}.txt
   done
 
-  # медиана (для REPS=3 это 2-я строка после сортировки)
   med=$(sort -n /tmp/times_${SLURM_JOB_ID}_${NT}.txt | awk 'NR==2{print $1}')
   rm -f /tmp/times_${SLURM_JOB_ID}_${NT}.txt
 
