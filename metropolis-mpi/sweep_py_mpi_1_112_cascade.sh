@@ -1,15 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=metro_py_mpi_sweep
+#SBATCH --job-name=metro_c_mpi_sweep
 #SBATCH --nodes=4
 #SBATCH --ntasks=112
 #SBATCH --cpus-per-task=1
-#SBATCH --time=00:40:00
+#SBATCH --time=00:30:00
 #SBATCH --partition=tornado
-#SBATCH --output=/home/ipmmstudy2/tm5u6/metropolis-mpi/logs/py_mpi_sweep_%j.out
+#SBATCH --output=/home/ipmmstudy2/tm5u6/metropolis-mpi/logs/c_mpi_sweep_%j.out
 
 set -euo pipefail
 
-# --- чтобы лог точно было куда писать ---
 mkdir -p /home/ipmmstudy2/tm5u6/metropolis-mpi/logs
 
 echo "Date              = $(date)"
@@ -21,40 +20,30 @@ echo "Number of Tasks Allocated      = $SLURM_NTASKS"
 echo "Number of Cores/Task Allocated = $SLURM_CPUS_PER_TASK"
 echo ""
 
-module load mpi/openmpi/4.0.1/gcc/9
-module load python/3.11
+module load compiler/gcc/11 mpi/openmpi/4.1.6/gcc/11
 
-echo "Python path: $(which python3 || true)"
-python3 -V
+cd "$HOME/metropolis-mpi/metropolis-mpi"
 
-# Проверка mpi4py
-python3 -c "import mpi4py; import numpy; print('mpi4py ok')"
-echo ""
+INC="-I$HOME/sprng_lib/sprng/include"
+LIB="-L$HOME/sprng_lib/sprng/lib -llcg -lm"
 
-# --- переходим туда, где лежит твой python-код ---
-cd "$HOME/metropolis-mpi/metropolis-py-mpi"
+BIN="metropolic_${SLURM_JOB_ID}"
+mpicc -O3 -std=c99 metropolic.c -o "$BIN" $INC $LIB
 
-# !!! ВАЖНО: проверь имя файла !!!
-# если файл называется metropolis_mpi.py -> оставь так
-PYFILE="metropolis_mpi.py"
-# если у тебя было metropolis_mpi.py (другая буква) — исправь здесь
-
-TOTAL_T=20000000
+TOTAL_T=200000
 SIGMA=0.5
-WRITE_CHAIN=0
+QUIET=1
 
-OUT="$HOME/metropolis-mpi/py_mpi_sweep_1_112_tornado_${SLURM_JOB_ID}.csv"
+OUT="$HOME/metropolis-mpi/c_mpi_sweep_1_112_tornado_${SLURM_JOB_ID}.csv"
 echo "p,elapsed" > "$OUT"
 
 for p in $(seq 1 112); do
   echo "Running p=$p..."
 
-  # запускаем и берём последнюю строку (там у тебя печатается Elapsed time ...)
-  line=$(mpirun -np $p --mca btl ^openib python3 "$PYFILE" "$TOTAL_T" "$SIGMA" "$WRITE_CHAIN" | tail -n 1)
+  # последняя строка в quiet режиме: NP=... elapsed=...
+  line=$(mpirun -np $p --mca btl ^openib ./"$BIN" $TOTAL_T $SIGMA $QUIET | tail -n 1)
 
-  # парсим "Elapsed time (Python + MPI): X seconds"
-  elapsed=$(echo "$line" | sed -n 's/.*Elapsed time (Python + MPI): \([0-9.]*\) seconds.*/\1/p')
-
+  elapsed=$(echo "$line" | sed -n 's/.*elapsed=\([0-9.]*\).*/\1/p')
   if [ -z "$elapsed" ]; then
     echo "Parse error. Last line was: $line"
     exit 1
