@@ -30,7 +30,7 @@ source $HOME/venvs/py311-mpi/bin/activate
 
 echo "python3: $(which python3)"
 python3 -V
-python3 -c "import mpi4py, numpy; print('mpi4py ok')"
+python3 -c "import mpi4py; print('mpi4py ok')"
 echo ""
 
 # переходим в папку с python-кодом
