@@ -21,10 +21,6 @@ def rng_uniform01(rng: np.random.Generator) -> float:
     return float(rng.random())
 
 
-def rng_normal01(rng: np.random.Generator) -> float:
-    return float(rng.normal())
-
-
 # ---------- целевая плотность π(x) ~ N(0, I) в 2D ----------
 
 def log_pi(x: np.ndarray) -> float:
@@ -39,7 +35,6 @@ def log_pi(x: np.ndarray) -> float:
 
 def q_sample(x: np.ndarray, sigma: float, rng: np.random.Generator) -> np.ndarray:
     """
-    x — numpy-вектор длины 2.
     Возвращает новое предложение y.
     """
     return x + sigma * rng.normal(size=2)
@@ -125,8 +120,9 @@ def main() -> None:
     sigma = 0.5
     x0 = np.array([0.0, 0.0], dtype=float)
     WRITE_CHAIN = 0       # 0 = не писать chain_rank*.dat (важно для свипов)
+    QUIET = 0             # 0 = подробный вывод, 1 = только строка для свипа
 
-    # argv: TOTAL_T sigma write_chain
+    # argv: TOTAL_T sigma write_chain quiet
     if len(sys.argv) > 1:
         tmpT = int(sys.argv[1])
         if tmpT > 0:
@@ -137,6 +133,8 @@ def main() -> None:
             sigma = tmpS
     if len(sys.argv) > 3:
         WRITE_CHAIN = int(sys.argv[3])
+    if len(sys.argv) > 4:
+        QUIET = 1 if int(sys.argv[4]) != 0 else 0
 
     # распределяем TOTAL_T по ранкам
     base_T = TOTAL_T // size
@@ -147,7 +145,7 @@ def main() -> None:
 
     t_start = MPI.Wtime()
 
-    if rank == 0:
+    if rank == 0 and not QUIET:
         print("Metropolis + Python + MPI")
         print(f"Processes: {size}")
         print(f"TOTAL_T (sum over ranks): {TOTAL_T}")
@@ -166,10 +164,10 @@ def main() -> None:
         x0, sigma, T_local, rank, rng, WRITE_CHAIN
     )
 
-    # acceptance rate по ранкам
+    # acceptance rate по ранкам (нужно для verbose)
     all_rates = comm.gather(local_acc_rate, root=0)
 
-    if rank == 0:
+    if rank == 0 and not QUIET:
         print("Acceptance rates per rank:")
         avg_rate = 0.0
         for r, rate in enumerate(all_rates):
@@ -186,8 +184,15 @@ def main() -> None:
     global_samples_used = comm.reduce(local_samples_used, op=MPI.SUM, root=0)
 
     t_end = MPI.Wtime()
+    elapsed = t_end - t_start
 
     if rank == 0:
+        if QUIET:
+            # ОДНА строка для свипа (стабильный парсинг в bash)
+            print(f"NP={size} TOTAL_T={TOTAL_T} elapsed={elapsed:.6f}")
+            return
+
+        # подробный вывод
         N = global_samples_used if global_samples_used > 0 else 1
         mean = global_sum_x / N
         var = global_sumsq_x / N - mean * mean
@@ -199,7 +204,7 @@ def main() -> None:
         print(f"  Mean:     [{mean[0]:.6f}, {mean[1]:.6f}]")
         print(f"  Variance: [{var[0]:.6f}, {var[1]:.6f}]")
         print()
-        print(f"Elapsed time (Python + MPI): {t_end - t_start:.6f} seconds")
+        print(f"Elapsed time (Python + MPI): {elapsed:.6f} seconds")
 
 
 if __name__ == "__main__":
