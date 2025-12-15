@@ -15,7 +15,7 @@ mkdir -p "$LOGDIR"
 
 module load compiler/gcc/11
 
-cd "$ROOT/metropolis-pthreads"
+cd "$ROOT/metropolis_pthreads"
 
 # Собираем
 gcc -O3 -std=c99 metropolis_pthreads.c -o metropolis_pthreads \
@@ -23,7 +23,7 @@ gcc -O3 -std=c99 metropolis_pthreads.c -o metropolis_pthreads \
   -L$HOME/sprng_lib/sprng/lib -llcg \
   -lpthread -lm
 
-TOTAL_T=10000000
+TOTAL_T=100000
 SIGMA=0.5
 WRITE_CHAIN=0
 QUIET=1
