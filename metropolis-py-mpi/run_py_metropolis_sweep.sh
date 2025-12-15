@@ -39,7 +39,7 @@ cd "$ROOT/metropolis-py-mpi"
 PYFILE="metropolis_mpi.py"
 
 # параметры эксперимента
-TOTAL_T=10000000
+TOTAL_T=100000
 SIGMA=0.5
 WRITE_CHAIN=0
 QUIET=1

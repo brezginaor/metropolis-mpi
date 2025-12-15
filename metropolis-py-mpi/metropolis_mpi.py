@@ -2,110 +2,103 @@
 import sys
 import math
 from mpi4py import MPI
-import numpy as np
+import random
 
 SEED = 123456789
 
 
 # ---------- RNG на каждом ранге ----------
 
-def init_rng(rank: int) -> np.random.Generator:
+def init_rng(rank: int) -> random.Random:
     """
-    Создаём независимый генератор NumPy для каждого ранга.
+    Независимый генератор random.Random для каждого ранга.
     """
-    seed_seq = np.random.SeedSequence(SEED + rank)
-    return np.random.default_rng(seed_seq)
+    return random.Random(SEED + rank)
 
 
-def rng_uniform01(rng: np.random.Generator) -> float:
-    return float(rng.random())
+def rng_uniform01(rng: random.Random) -> float:
+    return rng.random()  # [0,1)
+
+
+def rng_normal01(rng: random.Random) -> float:
+    """
+    N(0,1). В random.Random есть gauss(mu, sigma).
+    """
+    return rng.gauss(0.0, 1.0)
 
 
 # ---------- целевая плотность π(x) ~ N(0, I) в 2D ----------
 
-def log_pi(x: np.ndarray) -> float:
-    """
-    x — numpy-вектор длины 2.
-    log π(x) для стандартной 2D нормали (с точностью до константы).
-    """
-    return -0.5 * float(np.dot(x, x))
+def log_pi(x0: float, x1: float) -> float:
+    return -0.5 * (x0 * x0 + x1 * x1)
 
 
 # ---------- предложение q: y = x + N(0, sigma^2 I) ----------
 
-def q_sample(x: np.ndarray, sigma: float, rng: np.random.Generator) -> np.ndarray:
-    """
-    Возвращает новое предложение y.
-    """
-    return x + sigma * rng.normal(size=2)
+def q_sample(x0: float, x1: float, sigma: float, rng: random.Random):
+    y0 = x0 + sigma * rng_normal01(rng)
+    y1 = x1 + sigma * rng_normal01(rng)
+    return y0, y1
 
 
-def metropolis_step(x: np.ndarray, logp: float, sigma: float, rng: np.random.Generator):
-    """
-    Один шаг алгоритма Метрополиса.
-    Возвращает (x_new, logp_new, accepted).
-    """
-    y = q_sample(x, sigma, rng)
-    logp_new = log_pi(y)
+def metropolis_step(x0: float, x1: float, logp: float, sigma: float, rng: random.Random):
+    y0, y1 = q_sample(x0, x1, sigma, rng)
+    logp_new = log_pi(y0, y1)
     log_r = logp_new - logp
 
     if log_r >= 0.0:
-        return y, logp_new, 1
+        return y0, y1, logp_new, 1
 
     u = rng_uniform01(rng)
     if u < math.exp(log_r):
-        return y, logp_new, 1
-    return x, logp, 0
+        return y0, y1, logp_new, 1
+
+    return x0, x1, logp, 0
 
 
 # ---------- одна локальная цепочка на ранге ----------
 
-def run_chain(
-    x0: np.ndarray,
-    sigma: float,
-    T_local: int,
-    rank: int,
-    rng: np.random.Generator,
-    write_chain: int,
-):
+def run_chain(x0_init: float, x1_init: float,
+              sigma: float, T_local: int, rank: int,
+              rng: random.Random, write_chain: int):
     """
-    Запускает одну цепочку длины T_local на данном ранге.
-
-    Если write_chain != 0, пишет chain_rank<rank>.dat.
     Возвращает:
-      acc_rate, accepted_total, sum_x(2), sumsq_x(2), samples_used
+      acc_rate, accepted_total, sum_x0, sum_x1, sumsq_x0, sumsq_x1, samples_used
     """
-    x = np.array(x0, dtype=float)
-    logp = log_pi(x)
+    x0 = x0_init
+    x1 = x1_init
+    logp = log_pi(x0, x1)
 
     accepted_total = 0
-    sum_x = np.zeros(2, dtype=float)
-    sumsq_x = np.zeros(2, dtype=float)
+    sum_x0 = 0.0
+    sum_x1 = 0.0
+    sumsq_x0 = 0.0
+    sumsq_x1 = 0.0
 
     f = None
     if write_chain:
-        filename = f"chain_rank{rank}.dat"
-        f = open(filename, "w", encoding="utf-8")
+        f = open(f"chain_rank{rank}.dat", "w", encoding="utf-8")
         f.write("# t x0 x1\n")
-        f.write(f"0 {x[0]:.10f} {x[1]:.10f}\n")
+        f.write(f"0 {x0:.10f} {x1:.10f}\n")
 
-    # статистику считаем по t=1..T_local-1
     for t in range(1, T_local):
-        x, logp, acc = metropolis_step(x, logp, sigma, rng)
+        x0, x1, logp, acc = metropolis_step(x0, x1, logp, sigma, rng)
         accepted_total += acc
 
-        sum_x += x
-        sumsq_x += x * x
+        sum_x0 += x0
+        sum_x1 += x1
+        sumsq_x0 += x0 * x0
+        sumsq_x1 += x1 * x1
 
         if f is not None:
-            f.write(f"{t} {x[0]:.10f} {x[1]:.10f}\n")
+            f.write(f"{t} {x0:.10f} {x1:.10f}\n")
 
     if f is not None:
         f.close()
 
     samples_used = max(T_local - 1, 0)
     acc_rate = accepted_total / samples_used if samples_used > 0 else 0.0
-    return acc_rate, accepted_total, sum_x, sumsq_x, samples_used
+    return acc_rate, accepted_total, sum_x0, sum_x1, sumsq_x0, sumsq_x1, samples_used
 
 
 # ---------- main с MPI ----------
@@ -115,12 +108,10 @@ def main() -> None:
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    # параметры по умолчанию
-    TOTAL_T = 200_000     # суммарное число шагов по всем процессам
+    TOTAL_T = 200_000
     sigma = 0.5
-    x0 = np.array([0.0, 0.0], dtype=float)
-    WRITE_CHAIN = 0       # 0 = не писать chain_rank*.dat (важно для свипов)
-    QUIET = 0             # 0 = подробный вывод, 1 = только строка для свипа
+    WRITE_CHAIN = 0
+    QUIET = 0
 
     # argv: TOTAL_T sigma write_chain quiet
     if len(sys.argv) > 1:
@@ -136,17 +127,17 @@ def main() -> None:
     if len(sys.argv) > 4:
         QUIET = 1 if int(sys.argv[4]) != 0 else 0
 
-    # распределяем TOTAL_T по ранкам
+    # Раздаём TOTAL_T по ранкам
     base_T = TOTAL_T // size
-    remainder = TOTAL_T % size
-    T_local = base_T + 1 if rank < remainder else base_T
+    rem = TOTAL_T % size
+    T_local = base_T + 1 if rank < rem else base_T
     if T_local < 2:
         T_local = 2
 
     t_start = MPI.Wtime()
 
     if rank == 0 and not QUIET:
-        print("Metropolis + Python + MPI")
+        print("Metropolis + Python + MPI (no numpy)")
         print(f"Processes: {size}")
         print(f"TOTAL_T (sum over ranks): {TOTAL_T}")
         print(f"Local T on rank 0: {T_local}")
@@ -156,53 +147,53 @@ def main() -> None:
 
     rng = init_rng(rank)
 
-    (local_acc_rate,
-     local_accepted,
-     local_sum_x,
-     local_sumsq_x,
-     local_samples_used) = run_chain(
-        x0, sigma, T_local, rank, rng, WRITE_CHAIN
+    (local_acc_rate, local_accepted,
+     local_sum_x0, local_sum_x1,
+     local_sumsq_x0, local_sumsq_x1,
+     local_samples) = run_chain(
+        0.0, 0.0, sigma, T_local, rank, rng, WRITE_CHAIN
     )
 
-    # acceptance rate по ранкам (нужно для verbose)
     all_rates = comm.gather(local_acc_rate, root=0)
 
     if rank == 0 and not QUIET:
         print("Acceptance rates per rank:")
-        avg_rate = 0.0
+        avg = 0.0
         for r, rate in enumerate(all_rates):
             print(f"  rank {r}: {rate:.4f}")
-            avg_rate += rate
-        avg_rate /= size
-        print(f"Average acceptance rate (by ranks): {avg_rate:.4f}")
+            avg += rate
+        avg /= size
+        print(f"Average acceptance rate (by ranks): {avg:.4f}")
         print()
 
-    # глобальные суммы
+    # Reduce статистик
     global_accepted = comm.reduce(local_accepted, op=MPI.SUM, root=0)
-    global_sum_x = comm.reduce(local_sum_x, op=MPI.SUM, root=0)
-    global_sumsq_x = comm.reduce(local_sumsq_x, op=MPI.SUM, root=0)
-    global_samples_used = comm.reduce(local_samples_used, op=MPI.SUM, root=0)
+    global_sum_x0 = comm.reduce(local_sum_x0, op=MPI.SUM, root=0)
+    global_sum_x1 = comm.reduce(local_sum_x1, op=MPI.SUM, root=0)
+    global_sumsq_x0 = comm.reduce(local_sumsq_x0, op=MPI.SUM, root=0)
+    global_sumsq_x1 = comm.reduce(local_sumsq_x1, op=MPI.SUM, root=0)
+    global_samples = comm.reduce(local_samples, op=MPI.SUM, root=0)
 
     t_end = MPI.Wtime()
     elapsed = t_end - t_start
 
     if rank == 0:
         if QUIET:
-            # ОДНА строка для свипа (стабильный парсинг в bash)
             print(f"NP={size} TOTAL_T={TOTAL_T} elapsed={elapsed:.6f}")
             return
 
-        # подробный вывод
-        N = global_samples_used if global_samples_used > 0 else 1
-        mean = global_sum_x / N
-        var = global_sumsq_x / N - mean * mean
+        N = global_samples if global_samples > 0 else 1
+        mean0 = global_sum_x0 / N
+        mean1 = global_sum_x1 / N
+        var0 = global_sumsq_x0 / N - mean0 * mean0
+        var1 = global_sumsq_x1 / N - mean1 * mean1
         acc_rate_global = global_accepted / N
 
         print("Global stats over all ranks:")
         print(f"  Samples used (sum over ranks): {N}")
         print(f"  Acceptance rate (per step): {acc_rate_global:.6f}")
-        print(f"  Mean:     [{mean[0]:.6f}, {mean[1]:.6f}]")
-        print(f"  Variance: [{var[0]:.6f}, {var[1]:.6f}]")
+        print(f"  Mean:     [{mean0:.6f}, {mean1:.6f}]")
+        print(f"  Variance: [{var0:.6f}, {var1:.6f}]")
         print()
         print(f"Elapsed time (Python + MPI): {elapsed:.6f} seconds")
 
