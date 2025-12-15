@@ -26,6 +26,8 @@ echo ""
 module load mpi/openmpi/4.0.1/gcc/9
 module load python/3.11
 
+source $HOME/venvs/py311-mpi/bin/activate
+
 echo "python3: $(which python3)"
 python3 -V
 python3 -c "import mpi4py, numpy; print('mpi4py ok')"
