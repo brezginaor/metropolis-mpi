@@ -12,6 +12,8 @@
 
 static int *rng_stream = NULL;
 
+/* ---------- RNG ---------- */
+
 void init_rng_stream(int rank, int size)
 {
     rng_stream = init_rng(rank, size, SEED, 0);
@@ -29,91 +31,94 @@ void free_rng_stream(void)
     }
 }
 
-double rng_uniform01(void)
+static inline double rng_uniform01(void)
 {
-    return sprng(rng_stream);
+    return sprng(rng_stream); // [0,1)
 }
 
-double rng_normal01(void)
+static inline double rng_normal01(void)
 {
+    // Box–Muller
     double u1 = rng_uniform01();
     double u2 = rng_uniform01();
-
     if (u1 < 1e-12) u1 = 1e-12;
 
-    double r = sqrt(-2.0 * log(u1));
+    double r     = sqrt(-2.0 * log(u1));
     double theta = 2.0 * M_PI * u2;
-
     return r * cos(theta);
 }
 
-double log_pi(const double x[2])
+/* ---------- Target log-density ---------- */
+
+static inline double log_pi(const double x[2])
 {
     return -0.5 * (x[0] * x[0] + x[1] * x[1]);
 }
 
-void q_sample(const double x[2], double y[2], double sigma)
+/* Proposal: y = x + N(0, sigma^2 I) */
+static inline void q_sample(const double x[2], double y[2], double sigma)
 {
     y[0] = x[0] + sigma * rng_normal01();
     y[1] = x[1] + sigma * rng_normal01();
 }
 
-void metropolis_step(double x[2], double *logp, double sigma, int *accepted)
+/* One Metropolis step */
+static inline void metropolis_step(double x[2], double *logp, double sigma, int *accepted)
 {
     double y[2];
     q_sample(x, y, sigma);
 
     double logp_new = log_pi(y);
-    double log_r = logp_new - (*logp);
+    double log_r    = logp_new - (*logp);
 
     if (log_r >= 0.0) {
         x[0] = y[0];
         x[1] = y[1];
         *logp = logp_new;
         *accepted = 1;
+        return;
+    }
+
+    double u = rng_uniform01();
+    if (u < exp(log_r)) {
+        x[0] = y[0];
+        x[1] = y[1];
+        *logp = logp_new;
+        *accepted = 1;
     } else {
-        double u = rng_uniform01();
-        if (u < exp(log_r)) {
-            x[0] = y[0];
-            x[1] = y[1];
-            *logp = logp_new;
-            *accepted = 1;
-        } else {
-            *accepted = 0;
-        }
+        *accepted = 0;
     }
 }
 
-/* одна цепочка */
-double run_chain(const double x0[2], double sigma, int T, int rank,
-                 int write_chain,
-                 int *accepted_total_out,
-                 double sum_x_out[2],
-                 double sumsq_x_out[2])
+/* ---------- One chain, COMPUTE ONLY (no I/O inside timing) ---------- */
+/*
+   Runs T steps, accumulates stats.
+   If out_chain is not NULL, stores x(t) for t=0..T-1 into out_chain[2*t + 0/1]
+   (this is used to write to file AFTER timing).
+*/
+double run_chain_compute_only(const double x0[2], double sigma, int T,
+                              int *accepted_total_out,
+                              double sum_x_out[2],
+                              double sumsq_x_out[2],
+                              double *compute_time_out,
+                              double *out_chain /* nullable */)
 {
     double x[2] = {x0[0], x0[1]};
     double logp = log_pi(x);
 
     int accepted_count = 0;
-    int acc;
-
     double sum_x[2]   = {0.0, 0.0};
     double sumsq_x[2] = {0.0, 0.0};
 
-    FILE *f = NULL;
-    if (write_chain) {
-        char filename[64];
-        snprintf(filename, sizeof(filename), "chain_rank%d.dat", rank);
-        f = fopen(filename, "w");
-        if (!f) {
-            fprintf(stderr, "Rank %d: cannot open output file %s\n", rank, filename);
-            return -1.0;
-        }
-        fprintf(f, "# t x0 x1\n");
-        fprintf(f, "0 %.10f %.10f\n", x[0], x[1]);
+    if (out_chain) {
+        out_chain[0] = x[0];
+        out_chain[1] = x[1];
     }
 
+    double t0 = MPI_Wtime();
+
     for (int t = 1; t < T; ++t) {
+        int acc = 0;
         metropolis_step(x, &logp, sigma, &acc);
         accepted_count += acc;
 
@@ -122,19 +127,40 @@ double run_chain(const double x0[2], double sigma, int T, int rank,
         sumsq_x[0] += x[0] * x[0];
         sumsq_x[1] += x[1] * x[1];
 
-        if (f) {
-            fprintf(f, "%d %.10f %.10f\n", t, x[0], x[1]);
+        if (out_chain) {
+            out_chain[2*t + 0] = x[0];
+            out_chain[2*t + 1] = x[1];
         }
     }
 
-    if (f) fclose(f);
+    double t1 = MPI_Wtime();
+    if (compute_time_out) *compute_time_out = (t1 - t0);
 
     if (accepted_total_out) *accepted_total_out = accepted_count;
-    if (sum_x_out)   { sum_x_out[0] = sum_x[0];   sum_x_out[1] = sum_x[1]; }
+    if (sum_x_out)   { sum_x_out[0] = sum_x[0];     sum_x_out[1] = sum_x[1]; }
     if (sumsq_x_out) { sumsq_x_out[0] = sumsq_x[0]; sumsq_x_out[1] = sumsq_x[1]; }
 
     double acc_rate = (T > 1) ? ((double)accepted_count / (double)(T - 1)) : 0.0;
     return acc_rate;
+}
+
+/* Write chain AFTER timing */
+static void write_chain_file(int rank, int T, const double *chain)
+{
+    char filename[64];
+    snprintf(filename, sizeof(filename), "chain_rank%d.dat", rank);
+    FILE *f = fopen(filename, "w");
+    if (!f) {
+        fprintf(stderr, "Rank %d: cannot open %s for writing\n", rank, filename);
+        return;
+    }
+    fprintf(f, "# t x0 x1\n");
+    for (int t = 0; t < T; ++t) {
+        double x0 = chain[2*t + 0];
+        double x1 = chain[2*t + 1];
+        fprintf(f, "%d %.10f %.10f\n", t, x0, x1);
+    }
+    fclose(f);
 }
 
 int main(int argc, char *argv[])
@@ -157,12 +183,11 @@ int main(int argc, char *argv[])
     if (argc > 3) { write_chain = (atoi(argv[3]) != 0); }
     if (argc > 4) { quiet = (atoi(argv[4]) != 0); }
 
-    int base_T = TOTAL_T / size;
-    int rem    = TOTAL_T % size;
+    /* Split TOTAL_T across ranks */
+    int base_T  = TOTAL_T / size;
+    int rem     = TOTAL_T % size;
     int T_local = (rank < rem) ? (base_T + 1) : base_T;
     if (T_local < 2) T_local = 2;
-
-    double t_start = MPI_Wtime();
 
     if (rank == 0 && !quiet) {
         printf("Metropolis + MPI + SPRNG\n");
@@ -178,13 +203,36 @@ int main(int argc, char *argv[])
     int    local_accepted   = 0;
     double local_sum_x[2]   = {0.0, 0.0};
     double local_sumsq_x[2] = {0.0, 0.0};
+    double local_compute    = 0.0;
 
-    double local_acc_rate = run_chain(x0, sigma, T_local, rank, write_chain,
-                                      &local_accepted, local_sum_x, local_sumsq_x);
+    /* Optional chain buffer (ONLY if write_chain=1).
+       Note: storing doubles: 2*T_local doubles.
+    */
+    double *chain = NULL;
+    if (write_chain) {
+        chain = (double *)malloc((size_t)2 * (size_t)T_local * sizeof(double));
+        if (!chain) {
+            fprintf(stderr, "Rank %d: cannot allocate chain buffer\n", rank);
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+    }
+
+    double local_acc_rate = run_chain_compute_only(
+        x0, sigma, T_local,
+        &local_accepted,
+        local_sum_x,
+        local_sumsq_x,
+        &local_compute,
+        chain
+    );
+
+    /* Parallel elapsed time = max compute time across ranks */
+    double elapsed = 0.0;
+    MPI_Reduce(&local_compute, &elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     /* acceptance per rank */
     double *all_rates = NULL;
-    if (rank == 0) all_rates = (double *)malloc(size * sizeof(double));
+    if (rank == 0) all_rates = (double *)malloc((size_t)size * sizeof(double));
 
     MPI_Gather(&local_acc_rate, 1, MPI_DOUBLE,
                all_rates,        1, MPI_DOUBLE,
@@ -201,20 +249,24 @@ int main(int argc, char *argv[])
     }
     if (all_rates) free(all_rates);
 
-    /* global sums via Reduce (проще и быстрее, чем ручной Send/Recv) */
-    int    global_accepted = 0;
-    double global_sum_x[2] = {0.0, 0.0};
-    double global_sumsq_x[2] = {0.0, 0.0};
-    long long local_samples = (T_local > 1) ? (long long)(T_local - 1) : 0;
-    long long global_samples = 0;
+    /* Reduce global stats */
+    int        global_accepted = 0;
+    double     global_sum_x[2] = {0.0, 0.0};
+    double     global_sumsq_x[2] = {0.0, 0.0};
+    long long  local_samples = (T_local > 1) ? (long long)(T_local - 1) : 0;
+    long long  global_samples = 0;
 
     MPI_Reduce(&local_accepted, &global_accepted, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_sum_x, global_sum_x, 2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(local_sumsq_x, global_sumsq_x, 2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_samples, &global_samples, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    double t_end = MPI_Wtime();
-    double elapsed = t_end - t_start;
+    /* --- Write chain AFTER timing (optional) --- */
+    if (write_chain && chain) {
+        write_chain_file(rank, T_local, chain);
+    }
+
+    if (chain) free(chain);
 
     if (rank == 0) {
         if (quiet) {
@@ -235,7 +287,7 @@ int main(int argc, char *argv[])
             printf("  Acceptance rate (per step): %.6f\n", acc_rate_global);
             printf("  Mean:     [%.6f, %.6f]\n", mean0, mean1);
             printf("  Variance: [%.6f, %.6f]\n", var0, var1);
-            printf("\nElapsed time: %.6f seconds\n", elapsed);
+            printf("\nElapsed time (compute-only, max over ranks): %.6f seconds\n", elapsed);
         }
     }
 
