@@ -7,33 +7,21 @@ import random
 SEED = 123456789
 
 
-# ---------- RNG на каждом ранге ----------
-
 def init_rng(rank: int) -> random.Random:
-    """
-    Независимый генератор random.Random для каждого ранга.
-    """
     return random.Random(SEED + rank)
 
 
 def rng_uniform01(rng: random.Random) -> float:
-    return rng.random()  # [0,1)
+    return rng.random()
 
 
 def rng_normal01(rng: random.Random) -> float:
-    """
-    N(0,1). В random.Random есть gauss(mu, sigma).
-    """
     return rng.gauss(0.0, 1.0)
 
-
-# ---------- целевая плотность π(x) ~ N(0, I) в 2D ----------
 
 def log_pi(x0: float, x1: float) -> float:
     return -0.5 * (x0 * x0 + x1 * x1)
 
-
-# ---------- предложение q: y = x + N(0, sigma^2 I) ----------
 
 def q_sample(x0: float, x1: float, sigma: float, rng: random.Random):
     y0 = x0 + sigma * rng_normal01(rng)
@@ -56,14 +44,12 @@ def metropolis_step(x0: float, x1: float, logp: float, sigma: float, rng: random
     return x0, x1, logp, 0
 
 
-# ---------- одна локальная цепочка на ранге ----------
-
-def run_chain(x0_init: float, x1_init: float,
-              sigma: float, T_local: int, rank: int,
-              rng: random.Random, write_chain: int):
+def run_chain_compute_only(x0_init: float, x1_init: float,
+                           sigma: float, T_local: int, rng: random.Random,
+                           need_chain: int):
     """
-    Возвращает:
-      acc_rate, accepted_total, sum_x0, sum_x1, sumsq_x0, sumsq_x1, samples_used
+    Вычислительная часть (без записи в файл).
+    Если need_chain=1 -> сохраняем траекторию в память и вернём её, чтобы записать после таймера.
     """
     x0 = x0_init
     x1 = x1_init
@@ -75,11 +61,11 @@ def run_chain(x0_init: float, x1_init: float,
     sumsq_x0 = 0.0
     sumsq_x1 = 0.0
 
-    f = None
-    if write_chain:
-        f = open(f"chain_rank{rank}.dat", "w", encoding="utf-8")
-        f.write("# t x0 x1\n")
-        f.write(f"0 {x0:.10f} {x1:.10f}\n")
+    chain = None
+    if need_chain:
+        chain = [(0, x0, x1)]
+
+    t0 = MPI.Wtime()
 
     for t in range(1, T_local):
         x0, x1, logp, acc = metropolis_step(x0, x1, logp, sigma, rng)
@@ -90,18 +76,25 @@ def run_chain(x0_init: float, x1_init: float,
         sumsq_x0 += x0 * x0
         sumsq_x1 += x1 * x1
 
-        if f is not None:
-            f.write(f"{t} {x0:.10f} {x1:.10f}\n")
+        if chain is not None:
+            chain.append((t, x0, x1))
 
-    if f is not None:
-        f.close()
+    t1 = MPI.Wtime()
+    compute_time = t1 - t0
 
     samples_used = max(T_local - 1, 0)
     acc_rate = accepted_total / samples_used if samples_used > 0 else 0.0
-    return acc_rate, accepted_total, sum_x0, sum_x1, sumsq_x0, sumsq_x1, samples_used
+
+    return (acc_rate, accepted_total, sum_x0, sum_x1, sumsq_x0, sumsq_x1,
+            samples_used, compute_time, chain)
 
 
-# ---------- main с MPI ----------
+def write_chain_file(rank: int, chain):
+    with open(f"chain_rank{rank}.dat", "w", encoding="utf-8") as f:
+        f.write("# t x0 x1\n")
+        for t, x0, x1 in chain:
+            f.write(f"{t} {x0:.10f} {x1:.10f}\n")
+
 
 def main() -> None:
     comm = MPI.COMM_WORLD
@@ -134,8 +127,6 @@ def main() -> None:
     if T_local < 2:
         T_local = 2
 
-    t_start = MPI.Wtime()
-
     if rank == 0 and not QUIET:
         print("Metropolis + Python + MPI (no numpy)")
         print(f"Processes: {size}")
@@ -150,9 +141,13 @@ def main() -> None:
     (local_acc_rate, local_accepted,
      local_sum_x0, local_sum_x1,
      local_sumsq_x0, local_sumsq_x1,
-     local_samples) = run_chain(
-        0.0, 0.0, sigma, T_local, rank, rng, WRITE_CHAIN
+     local_samples, local_compute,
+     chain) = run_chain_compute_only(
+        0.0, 0.0, sigma, T_local, rng, WRITE_CHAIN
     )
+
+    # Время параллельной вычислительной части = максимум по ранкам
+    elapsed_compute = comm.reduce(local_compute, op=MPI.MAX, root=0)
 
     all_rates = comm.gather(local_acc_rate, root=0)
 
@@ -174,12 +169,13 @@ def main() -> None:
     global_sumsq_x1 = comm.reduce(local_sumsq_x1, op=MPI.SUM, root=0)
     global_samples = comm.reduce(local_samples, op=MPI.SUM, root=0)
 
-    t_end = MPI.Wtime()
-    elapsed = t_end - t_start
+    # Запись цепочки ПОСЛЕ измерения (не входит в elapsed_compute)
+    if WRITE_CHAIN and chain is not None:
+        write_chain_file(rank, chain)
 
     if rank == 0:
         if QUIET:
-            print(f"NP={size} TOTAL_T={TOTAL_T} elapsed={elapsed:.6f}")
+            print(f"NP={size} TOTAL_T={TOTAL_T} elapsed={elapsed_compute:.6f}")
             return
 
         N = global_samples if global_samples > 0 else 1
@@ -195,7 +191,7 @@ def main() -> None:
         print(f"  Mean:     [{mean0:.6f}, {mean1:.6f}]")
         print(f"  Variance: [{var0:.6f}, {var1:.6f}]")
         print()
-        print(f"Elapsed time (Python + MPI): {elapsed:.6f} seconds")
+        print(f"Elapsed time (Python + MPI, compute-only): {elapsed_compute:.6f} seconds")
 
 
 if __name__ == "__main__":
