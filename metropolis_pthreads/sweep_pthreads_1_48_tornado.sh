@@ -17,17 +17,15 @@ module load compiler/gcc/11
 
 cd "$ROOT/metropolis_pthreads"
 
-# Собираем
 gcc -O3 -std=c99 metropolis_pthreads.c -o metropolis_pthreads \
-  -I$HOME/sprng_lib/sprng/include \
-  -L$HOME/sprng_lib/sprng/lib -llcg \
+  -I"$HOME/sprng_lib/sprng/include" \
+  -L"$HOME/sprng_lib/sprng/lib" -llcg \
   -lpthread -lm
 
 TOTAL_T=10000000
 SIGMA=0.5
 WRITE_CHAIN=0
 QUIET=1
-
 REPS=3
 
 OUT="$ROOT/c_pthreads_sweep_1_48_tornado_${SLURM_JOB_ID}.csv"
@@ -37,7 +35,7 @@ for p in $(seq 1 48); do
   echo "Running p=$p..."
 
   for r in $(seq 1 $REPS); do
-    line=$(./metropolis_pthreads $TOTAL_T $SIGMA $p $WRITE_CHAIN $QUIET | tail -n 1)
+    line=$(./metropolis_pthreads "$TOTAL_T" "$SIGMA" "$p" "$WRITE_CHAIN" "$QUIET" | tail -n 1)
     elapsed=$(echo "$line" | sed -n 's/.*elapsed=\([0-9.]*\).*/\1/p')
     if [ -z "$elapsed" ]; then
       echo "Parse error (p=$p, rep=$r). Last line was: $line"
@@ -47,7 +45,6 @@ for p in $(seq 1 48); do
     echo "$elapsed" >> /tmp/times_${SLURM_JOB_ID}_${p}.txt
   done
 
-  # медиана (для REPS=3 это 2-я строка после сортировки)
   med=$(sort -n /tmp/times_${SLURM_JOB_ID}_${p}.txt | awk 'NR==2{print $1}')
   rm -f /tmp/times_${SLURM_JOB_ID}_${p}.txt
 

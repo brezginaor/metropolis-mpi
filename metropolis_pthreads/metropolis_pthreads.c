@@ -20,6 +20,9 @@ typedef struct {
     double sigma;
     int write_chain;
 
+    // буфер траектории (если write_chain=1): 2*T_local double
+    double *chain; // [x0(t), x1(t)] подряд
+
     // результаты
     int accepted;
     double sum_x0, sum_x1;
@@ -76,13 +79,19 @@ static inline void metropolis_step(double *x0, double *x1, double *logp,
     }
 }
 
-/* ---------- Thread body ---------- */
+/* ---------- Timing ---------- */
+
+static double wall_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+/* ---------- Thread body (compute only; no file I/O) ---------- */
 
 static void *thread_main(void *arg) {
     thread_ctx_t *ctx = (thread_ctx_t *)arg;
 
-    // SPRNG stream per thread:
-    // init_rng(gennum, total_gen, seed, param)
     int *stream = init_rng(ctx->tid, ctx->nthreads, SEED, 0);
     if (!stream) {
         fprintf(stderr, "Thread %d: init_rng failed\n", ctx->tid);
@@ -96,21 +105,13 @@ static void *thread_main(void *arg) {
     double sum_x0 = 0.0, sum_x1 = 0.0;
     double sumsq_x0 = 0.0, sumsq_x1 = 0.0;
 
-    FILE *f = NULL;
-    if (ctx->write_chain) {
-        char name[128];
-        snprintf(name, sizeof(name), "chain_thread%d.dat", ctx->tid);
-        f = fopen(name, "w");
-        if (!f) {
-            fprintf(stderr, "Thread %d: cannot open %s\n", ctx->tid, name);
-            free_rng(stream);
-            pthread_exit((void*)2);
-        }
-        fprintf(f, "# t x0 x1\n");
-        fprintf(f, "0 %.10f %.10f\n", x0, x1);
-    }
-
     int samples_used = (ctx->T_local > 1) ? (ctx->T_local - 1) : 0;
+
+    // сохраняем t=0
+    if (ctx->chain) {
+        ctx->chain[0] = x0;
+        ctx->chain[1] = x1;
+    }
 
     for (int t = 1; t < ctx->T_local; ++t) {
         int acc = 0;
@@ -120,10 +121,12 @@ static void *thread_main(void *arg) {
         sum_x0 += x0; sum_x1 += x1;
         sumsq_x0 += x0*x0; sumsq_x1 += x1*x1;
 
-        if (f) fprintf(f, "%d %.10f %.10f\n", t, x0, x1);
+        // сохраняем точку в буфер (если надо)
+        if (ctx->chain) {
+            ctx->chain[2*t + 0] = x0;
+            ctx->chain[2*t + 1] = x1;
+        }
     }
-
-    if (f) fclose(f);
 
     ctx->accepted = accepted_total;
     ctx->sum_x0 = sum_x0; ctx->sum_x1 = sum_x1;
@@ -135,12 +138,24 @@ static void *thread_main(void *arg) {
     pthread_exit(NULL);
 }
 
-/* ---------- Timing ---------- */
+/* ---------- Write chain AFTER timing ---------- */
 
-static double wall_seconds(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+static void write_chain_file(int tid, int T_local, const double *chain) {
+    char name[128];
+    snprintf(name, sizeof(name), "chain_thread%d.dat", tid);
+
+    FILE *f = fopen(name, "w");
+    if (!f) {
+        fprintf(stderr, "Thread %d: cannot open %s\n", tid, name);
+        return;
+    }
+
+    fprintf(f, "# t x0 x1\n");
+    for (int t = 0; t < T_local; ++t) {
+        fprintf(f, "%d %.10f %.10f\n",
+                t, chain[2*t + 0], chain[2*t + 1]);
+    }
+    fclose(f);
 }
 
 /* ---------- main ---------- */
@@ -174,14 +189,31 @@ int main(int argc, char **argv) {
     long long base = TOTAL_T / nthreads;
     long long rem  = TOTAL_T % nthreads;
 
-    pthread_t *ths = (pthread_t *)calloc(nthreads, sizeof(pthread_t));
-    thread_ctx_t *ctx = (thread_ctx_t *)calloc(nthreads, sizeof(thread_ctx_t));
+    pthread_t *ths = (pthread_t *)calloc((size_t)nthreads, sizeof(pthread_t));
+    thread_ctx_t *ctx = (thread_ctx_t *)calloc((size_t)nthreads, sizeof(thread_ctx_t));
     if (!ths || !ctx) {
         fprintf(stderr, "Allocation error\n");
         free(ths); free(ctx);
         return 1;
     }
 
+    // буферы цепочек (только если write_chain=1)
+    if (write_chain) {
+        for (int i = 0; i < nthreads; ++i) {
+            int T_local_i = (int)(base + (i < rem ? 1 : 0));
+            if (T_local_i < 2) T_local_i = 2;
+
+            ctx[i].chain = (double *)malloc((size_t)2 * (size_t)T_local_i * sizeof(double));
+            if (!ctx[i].chain) {
+                fprintf(stderr, "Allocation error: chain buffer thread %d\n", i);
+                return 2;
+            }
+        }
+    } else {
+        for (int i = 0; i < nthreads; ++i) ctx[i].chain = NULL;
+    }
+
+    // --- СТАРТ ТАЙМЕРА: только вычисления ---
     double t0 = wall_seconds();
 
     for (int i = 0; i < nthreads; ++i) {
@@ -197,7 +229,7 @@ int main(int argc, char **argv) {
         int rc = pthread_create(&ths[i], NULL, thread_main, &ctx[i]);
         if (rc != 0) {
             fprintf(stderr, "pthread_create failed for thread %d\n", i);
-            return 2;
+            return 3;
         }
     }
 
@@ -206,7 +238,15 @@ int main(int argc, char **argv) {
     }
 
     double t1 = wall_seconds();
-    double elapsed = t1 - t0;
+    double elapsed_compute = t1 - t0;
+    // --- КОНЕЦ ТАЙМЕРА ---
+
+    // запись цепочек ПОСЛЕ измерения времени
+    if (write_chain) {
+        for (int i = 0; i < nthreads; ++i) {
+            write_chain_file(ctx[i].tid, ctx[i].T_local, ctx[i].chain);
+        }
+    }
 
     // суммируем статистики
     long long N = 0;
@@ -238,7 +278,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nthreads; ++i) TOTAL_USED += ctx[i].T_local;
 
     if (quiet) {
-        printf("PTH=%d TOTAL_T=%lld elapsed=%.6f\n", nthreads, TOTAL_USED, elapsed);
+        printf("PTH=%d TOTAL_T=%lld elapsed=%.6f\n", nthreads, TOTAL_USED, elapsed_compute);
     } else {
         printf("Metropolis + C + pthreads + SPRNG\n");
         printf("Threads: %d\n", nthreads);
@@ -259,9 +299,13 @@ int main(int argc, char **argv) {
         printf("  Mean:     [%.6f, %.6f]\n", mean0, mean1);
         printf("  Variance: [%.6f, %.6f]\n\n", var0, var1);
 
-        printf("Elapsed time (pthreads): %.6f seconds\n", elapsed);
+        printf("Elapsed time (pthreads, compute-only): %.6f seconds\n", elapsed_compute);
     }
 
+    // cleanup
+    if (write_chain) {
+        for (int i = 0; i < nthreads; ++i) free(ctx[i].chain);
+    }
     free(ths);
     free(ctx);
     return 0;
