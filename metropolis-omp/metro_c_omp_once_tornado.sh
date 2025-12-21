@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --time=00:20:00
 #SBATCH --partition=tornado
-#SBATCH --output=%x_%j.out
-#SBATCH --error=%x_%j.err
+#SBATCH --output=metro_c_omp_once_%j.out
+#SBATCH --error=metro_c_omp_once_%j.err
 
 set -euo pipefail
 
@@ -14,18 +14,19 @@ module purge
 module load compiler/gcc/11
 
 ROOT="$HOME/metropolis-mpi"
-WORKDIR="$ROOT/metropolis-omp"
-cd "$WORKDIR"
+cd "$ROOT/metropolis-omp"
 
-# --- сборка (verbose вывод как раньше) ---
+# без warning про rand_r
 gcc -O3 -std=c99 -D_POSIX_C_SOURCE=200112L -fopenmp -DVERBOSE \
   metropolis_omp.c -o metropolis_omp -lm
 
-# --- параметры (можно переопределять через sbatch) ---
-TOTAL_T="${1:-100000000}"
-SIGMA="${2:-0.5}"
-WRITE_CHAIN="${3:-1}"     # <<< ВАЖНО: 1 => пишем chain_omp_thread*.dat
-OMP_THREADS="${4:-$SLURM_CPUS_PER_TASK}"
+TOTAL_T=1000000   # Общее количество шагов
+SIGMA=0.5           # Стандартное отклонение для предложения
+OMP_THREADS="${SLURM_CPUS_PER_TASK}"  # Количество потоков, как в SLURM
+
+# Параметры записи (по умолчанию каждый шаг)
+WRITE_CHAIN=1       # 0 - не записывать, 1 - записывать
+WRITE_EVERY=1000    # Записывать каждую 1000-ю точку (по умолчанию)
 
 echo "Date              = $(date)"
 echo "Hostname          = $(hostname -s)"
@@ -35,18 +36,8 @@ echo "Nodes Allocated   = ${SLURM_JOB_NUM_NODES}"
 echo "Tasks Allocated   = ${SLURM_NTASKS}"
 echo "Cores/Task        = ${SLURM_CPUS_PER_TASK}"
 echo ""
-echo "Run config: OMP_NUM_THREADS=${OMP_THREADS} TOTAL_T=${TOTAL_T} SIGMA=${SIGMA} WRITE_CHAIN=${WRITE_CHAIN}"
+echo "Run config: OMP_NUM_THREADS=${OMP_THREADS} TOTAL_T=${TOTAL_T} SIGMA=${SIGMA} WRITE_CHAIN=${WRITE_CHAIN} WRITE_EVERY=${WRITE_EVERY}"
 echo ""
 
-export OMP_NUM_THREADS="$OMP_THREADS"
-export OMP_PROC_BIND=close
-export OMP_PLACES=cores
-
-# argv: TOTAL_T sigma write_chain
-srun -n 1 -c "${SLURM_CPUS_PER_TASK}" ./metropolis_omp "$TOTAL_T" "$SIGMA" "$WRITE_CHAIN"
-
-echo ""
-echo "Done."
-echo "Output files in: $WORKDIR"
-echo " - %x_%j.out / %x_%j.err"
-echo " - chain_omp_thread*.dat (if WRITE_CHAIN=1)"
+# Запуск программы с передачей параметров в программу
+srun -n 1 -c "${SLURM_CPUS_PER_TASK}" ./metropolis_omp "$TOTAL_T" "$SIGMA" "$WRITE_CHAIN" "$WRITE_EVERY"
