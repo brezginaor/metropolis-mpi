@@ -40,12 +40,13 @@ mpicc -O3 -std=c99 metropolic.c -o "$BIN" $INC $LIB
 P="${1:-112}"          # сколько процессов запустить
 TOTAL_T="${2:-100000000}"
 SIGMA="${3:-0.5}"
-QUIET=0                # 0 => полный вывод
+WRITE_CHAIN=1
+QUIET=0
 
 echo "Run config: P=$P TOTAL_T=$TOTAL_T SIGMA=$SIGMA QUIET=$QUIET"
 echo ""
 
-mpirun -np "$P" --mca btl ^openib "./$BIN" "$TOTAL_T" "$SIGMA" "$QUIET"
+mpirun -np "$P" --mca btl ^openib "./$BIN" "$TOTAL_T" "$SIGMA" "$WRITE_CHAIN" "$QUIET"
 
 echo ""
 echo "Done."
